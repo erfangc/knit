@@ -5,7 +5,11 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"strings"
 )
+
+var gitRepo string
+var email string
 
 var EKSCmd = &cobra.Command{
 	Use:   "eks",
@@ -14,9 +18,16 @@ var EKSCmd = &cobra.Command{
 		installTiller()
 		installNginx()
 		installCertManager()
-		installLetsEncryptIssuer()
-		installFluxd()
+		installLetsEncryptIssuer(email)
+		installFluxd(gitRepo)
 	},
+}
+
+func init() {
+	EKSCmd.Flags().StringVar(&gitRepo, "git-repo", "", "The Git repository to monitor")
+	EKSCmd.Flags().StringVar(&email, "email", "", "The email used to procure TLS certificates, this is passed to cert-manager")
+	EKSCmd.MarkFlagRequired("git-repo")
+	EKSCmd.MarkFlagRequired("email")
 }
 
 func installNginx() {
@@ -26,64 +37,65 @@ func installNginx() {
 	//
 }
 
-func installFluxd() {
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/master/deploy/flux-account.yaml"))
-	fluxDeployment := `
-		---
-		apiVersion: apps/v1
-		kind: Deployment
-		metadata:
-		  name: flux
-		spec:
-		  replicas: 1
-		  selector:
-		    matchLabels:
-		      name: flux
-		  strategy:
-		    type: Recreate
-		  template:
-		    metadata:
-		      annotations:
-		        prometheus.io/port: "3031" # tell prometheus to scrape /metrics endpoint's port.
-		      labels:
-		        name: flux
-		    spec:
-		      serviceAccountName: flux
-		      volumes:
-		      - name: git-key
-		        secret:
-		          secretName: flux-git-deploy
-		          defaultMode: 0400 # when mounted read-only, we won't be able to chmod
-		      - name: git-keygen
-		        emptyDir:
-		          medium: Memory
-		      containers:
-		      - name: flux
-		        image: docker.io/fluxcd/flux:1.13.3
-		        imagePullPolicy: IfNotPresent
-		        resources:
-		          requests:
-		            cpu: 50m
-		            memory: 64Mi
-		        ports:
-		        - containerPort: 3030 # informational
-		        volumeMounts:
-		        - name: git-key
-		          mountPath: /etc/fluxd/ssh
-		          readOnly: true
-		        - name: git-keygen
-		          mountPath: /var/fluxd/keygen
-		        args:
-		        - --memcached-service=
-		        - --ssh-keygen-dir=/var/fluxd/keygen
-		        - --git-url=git@github.com:weaveworks/flux-get-started
-		        - --git-branch=master
-		        - --listen-metrics=:3031
+func installFluxd(gitRepo string) {
+	version := "1.13.3"
+	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-account.yaml"))
+	deployment := `
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flux
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: flux
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        prometheus.io/port: "3031"
+      labels:
+        name: flux
+    spec:
+      serviceAccountName: flux
+      volumes:
+      - name: git-key
+        secret:
+          secretName: flux-git-deploy
+          defaultMode: 0400
+      - name: git-keygen
+        emptyDir:
+          medium: Memory
+      containers:
+      - name: flux
+        image: docker.io/fluxcd/flux:` + version + `
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        ports:
+        - containerPort: 3030
+        volumeMounts:
+        - name: git-key
+          mountPath: /etc/fluxd/ssh
+          readOnly: true
+        - name: git-keygen
+          mountPath: /var/fluxd/keygen
+        args:
+        - --memcached-service=
+        - --ssh-keygen-dir=/var/fluxd/keygen
+        - --git-url=` + gitRepo + `
+        - --git-branch=master
+        - --listen-metrics=:3031
 		`
-	log.Println(executeWithStdin(fluxDeployment, "kubectl", "apply", "-f", "-"))
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/1.13.3/deploy/flux-secret.yaml"))
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/1.13.3/deploy/memcache-dep.yaml"))
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/1.13.3/deploy/memcache-svc.yaml"))
+	log.Println(executeWithStdin(deployment, "kubectl", "apply", "-f", "-"))
+	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-secret.yaml"))
+	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-dep.yaml"))
+	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-svc.yaml"))
 }
 
 func installTiller() {
@@ -101,7 +113,7 @@ func installTiller() {
 	log.Println(execute("helm", "repo", "update"))
 }
 
-func installLetsEncryptIssuer() {
+func installLetsEncryptIssuer(email string) {
 	issuer := `
 		   apiVersion: certmanager.k8s.io/v1alpha1
 		   kind: Issuer
@@ -109,14 +121,10 @@ func installLetsEncryptIssuer() {
 		     name: letsencrypt-prod
 		   spec:
 		     acme:
-		       # The ACME server URL
 		       server: https://acme-v02.api.letsencrypt.org/directory
-		       # Email address used for ACME registration
-		       email: user@example.com
-		       # Name of a secret used to store the ACME account private key
+		       email: `+ email +`
 		       privateKeySecretRef:
 		         name: letsencrypt-prod
-		       # Enable the HTTP-01 challenge provider
 		       http01: {}
 		`
 	executeWithStdin(issuer, "kubectl", "apply", "-f", "-")
@@ -153,6 +161,7 @@ func installCertManager() {
 }
 
 func execute(cmd string, args ...string) string {
+	log.Println("Executing Command: " + cmd + " " + strings.Join(args, " "))
 	command := exec.Command(cmd, args...)
 	bytes, e := command.CombinedOutput()
 	if e != nil {
