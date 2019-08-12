@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
+	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/spf13/cobra"
 	"io"
 	"log"
@@ -16,27 +18,61 @@ var dnsName string
 var hostedZone string
 var gitRepo string
 var email string
+var sess *session.Session
 
 var EKSCmd = &cobra.Command{
 	Use:   "eks",
 	Short: "Work with an EKS cluster",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmds := []string{"kubectl", "helm"}
-		for _, cmd := range cmds {
-			if !commandExists(cmd) {
-				panic(cmd + " does not exist")
+
+		version := "v0.8.1"
+
+		executeP(
+			"kubectl",
+			"apply",
+			"-f",
+			"https://github.com/bitnami-labs/sealed-secrets/releases/download/"+version+"/controller.yaml",
+			)
+		executeP(
+			"kubectl",
+			"apply",
+			"-f",
+			"https://github.com/bitnami-labs/sealed-secrets/releases/download/"+version+"/sealedsecret-crd.yaml",
+		)
+
+		sm := secretsmanager.New(sess)
+		//
+		// see if a RSA keypair for already exist on the AWS account
+		//
+		response, err := sm.GetSecretValue(&secretsmanager.GetSecretValueInput{
+			SecretId:     aws.String("sealed-secrets/master-key"),
+		})
+
+		if err != nil {
+			if aerr, ok := err.(awserr.Error); ok {
+				switch aerr.Code() {
+				case secretsmanager.ErrCodeResourceNotFoundException:
+
+				}
 			}
 		}
-		log.Println("Setting up cluster ...")
-		installTiller()
-		time.Sleep(1000 * time.Millisecond)
-		installNginx()
-		time.Sleep(1000 * time.Millisecond)
-		installCertManager()
-		time.Sleep(1000 * time.Millisecond)
-		installLetsEncryptIssuer(email)
-		time.Sleep(1000 * time.Millisecond)
-		installFluxCD(gitRepo)
+
+		//cmds := []string{"kubectl", "helm"}
+		//for _, cmd := range cmds {
+		//	if !commandExists(cmd) {
+		//		panic(cmd + " does not exist")
+		//	}
+		//}
+		//log.Println("Setting up cluster ...")
+		//installTiller()
+		//time.Sleep(1000 * time.Millisecond)
+		//installNginx()
+		//time.Sleep(1000 * time.Millisecond)
+		//installCertManager()
+		//time.Sleep(1000 * time.Millisecond)
+		//installLetsEncryptIssuer(email)
+		//time.Sleep(1000 * time.Millisecond)
+		//installFluxCD(gitRepo)
 	},
 }
 
@@ -49,6 +85,7 @@ func init() {
 	EKSCmd.MarkFlagRequired("email")
 	EKSCmd.MarkFlagRequired("dns-name")
 	EKSCmd.MarkFlagRequired("hosted-zone")
+	sess = session.Must(session.NewSession())
 }
 
 func installNginx() {
@@ -75,7 +112,6 @@ func installNginx() {
 	}
 	log.Println("External host name found for nginx-ingress-controller: " + strings.ReplaceAll(externalHostName, "'", ""))
 	log.Println("Creating a DNS record for domain " + dnsName + " on hosted zone " + hostedZone)
-	sess := session.Must(session.NewSession())
 	r53 := route53.New(sess)
 	response, err := r53.ChangeResourceRecordSets(
 		&route53.ChangeResourceRecordSetsInput{
