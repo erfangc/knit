@@ -1,13 +1,19 @@
 package cmd
 
 import (
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/spf13/cobra"
 	"io"
 	"log"
 	"os/exec"
 	"strings"
+	"time"
 )
 
+var dnsName string
+var hostedZone string
 var gitRepo string
 var email string
 
@@ -15,29 +21,95 @@ var EKSCmd = &cobra.Command{
 	Use:   "eks",
 	Short: "Work with an EKS cluster",
 	Run: func(cmd *cobra.Command, args []string) {
+		cmds := []string{"kubectl", "helm"}
+		for _, cmd := range cmds {
+			if !commandExists(cmd) {
+				panic(cmd + " does not exist")
+			}
+		}
+		log.Println("Setting up cluster ...")
 		installTiller()
+		time.Sleep(1000 * time.Millisecond)
 		installNginx()
+		time.Sleep(1000 * time.Millisecond)
 		installCertManager()
+		time.Sleep(1000 * time.Millisecond)
 		installLetsEncryptIssuer(email)
-		installFluxd(gitRepo)
+		time.Sleep(1000 * time.Millisecond)
+		installFluxCD(gitRepo)
 	},
 }
 
 func init() {
 	EKSCmd.Flags().StringVar(&gitRepo, "git-repo", "", "The Git repository to monitor")
 	EKSCmd.Flags().StringVar(&email, "email", "", "The email used to procure TLS certificates, this is passed to cert-manager")
+	EKSCmd.Flags().StringVar(&dnsName, "dns-name", "", "The DNS name of the environment & cluster being initialized")
+	EKSCmd.Flags().StringVar(&hostedZone, "hosted-zone", "", "The route 53 hosted zone to use for creating CNAME or A DNS record")
 	EKSCmd.MarkFlagRequired("git-repo")
 	EKSCmd.MarkFlagRequired("email")
+	EKSCmd.MarkFlagRequired("dns-name")
+	EKSCmd.MarkFlagRequired("hosted-zone")
 }
 
 func installNginx() {
-	log.Println(execute("helm", "install", "stable/nginx-ingress", "--name", "default"))
-	//
-	// TODO figure out command for finding nginx ELB name so we can attach route 53 record
-	//
+	executeP("helm", "install", "stable/nginx-ingress", "--name", "default")
+	var externalHostName = execute(
+		"kubectl",
+		"get",
+		"svc",
+		"default-nginx-ingress-controller",
+		"-o",
+		"jsonpath='{.status.loadBalancer.ingress[].hostname}'",
+	)
+	for externalHostName == "''" {
+		log.Println("No external host name found for nginx-ingress-controller, waiting ...")
+		time.Sleep(10 * time.Second)
+		externalHostName = execute(
+			"kubectl",
+			"get",
+			"svc",
+			"default-nginx-ingress-controller",
+			"-o",
+			"jsonpath='{.status.loadBalancer.ingress[].hostname}'",
+		)
+	}
+	log.Println("External host name found for nginx-ingress-controller: " + strings.ReplaceAll(externalHostName, "'", ""))
+	log.Println("Creating a DNS record for domain " + dnsName + " on hosted zone " + hostedZone)
+	sess := session.Must(session.NewSession())
+	r53 := route53.New(sess)
+	response, err := r53.ChangeResourceRecordSets(
+		&route53.ChangeResourceRecordSetsInput{
+			ChangeBatch: &route53.ChangeBatch{
+				Changes: []*route53.Change{
+					{
+						Action: aws.String("UPSERT"),
+						ResourceRecordSet: &route53.ResourceRecordSet{
+							Name: aws.String(dnsName),
+							ResourceRecords: []*route53.ResourceRecord{
+								{Value: aws.String(externalHostName)},
+							},
+							TTL:  aws.Int64(300),
+							Type: aws.String("CNAME"),
+						},
+					}},
+				Comment: aws.String("CREATE/DELETE/UPSERT a record"),
+			},
+			HostedZoneId: aws.String(hostedZone),
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+	log.Println("DNS Change Info Status: " + *response.ChangeInfo.Status)
+	log.Println("DNS ChangeInfo Id: " + *response.ChangeInfo.Id)
 }
 
-func installFluxd(gitRepo string) {
+//
+// We install fluxcd, which will monitor our Git repository and deploy workloads
+// into the EKS cluster as changes are made to the git repo in a continuous deployment
+// pattern called GitOps
+//
+func installFluxCD(gitRepo string) {
 	version := "1.13.3"
 	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-account.yaml"))
 	deployment := `
@@ -91,73 +163,98 @@ spec:
         - --git-url=` + gitRepo + `
         - --git-branch=master
         - --listen-metrics=:3031
-		`
-	log.Println(executeWithStdin(deployment, "kubectl", "apply", "-f", "-"))
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-secret.yaml"))
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-dep.yaml"))
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-svc.yaml"))
+`
+	executeWithStdin(deployment, "kubectl", "apply", "-f", "-")
+	executeP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-secret.yaml")
+	executeP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-dep.yaml")
+	executeP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-svc.yaml")
 }
 
 func installTiller() {
-	log.Println(execute("kubectl", "create", "serviceaccount", "tiller", "--namespace=kube-system"))
-	log.Println(
-		execute("kubectl",
-			"create",
-			"clusterrolebinding",
-			"tiller-admin",
-			"--serviceaccount=kube-system:tiller",
-			"--clusterrole=cluster-admin",
-		),
+	sa := `
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tiller
+  namespace: kube-system
+`
+	executeWithStdin(sa, "kubectl", "apply", "-f", "-")
+
+	clusterRoleBinding := `
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    name: tiller-admin
+  name: tiller-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: tiller
+    namespace: kube-system
+`
+	executeWithStdin(
+		clusterRoleBinding,
+		"kubectl",
+		"apply",
+		"-f",
+		"-",
 	)
-	log.Println(execute("helm", "init", "--service-account=tiller"))
-	log.Println(execute("helm", "repo", "update"))
+	executeP("helm", "init", "--service-account=tiller")
+	executeP("helm", "repo", "update")
 }
 
 func installLetsEncryptIssuer(email string) {
 	issuer := `
-		   apiVersion: certmanager.k8s.io/v1alpha1
-		   kind: Issuer
-		   metadata:
-		     name: letsencrypt-prod
-		   spec:
-		     acme:
-		       server: https://acme-v02.api.letsencrypt.org/directory
-		       email: `+ email +`
-		       privateKeySecretRef:
-		         name: letsencrypt-prod
-		       http01: {}
-		`
+apiVersion: certmanager.k8s.io/v1alpha1
+kind: Issuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ` + email + `
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    http01: {}
+`
 	executeWithStdin(issuer, "kubectl", "apply", "-f", "-")
 }
 
 func installCertManager() {
-	log.Println(execute(
+	executeP(
 		"kubectl",
 		"apply",
 		"-f",
 		"https://raw.githubusercontent.com/jetstack/cert-manager/release-0.8/deploy/manifests/00-crds.yaml",
-	))
-	log.Println(execute(
+	)
+	executeP(
 		"helm",
 		"repo",
 		"add",
 		"jetstack",
 		"https://charts.jetstack.io",
-	))
-	log.Println(execute("helm", "repo", "update"))
-	log.Println(
-		execute(
-			"helm",
-			"install",
-			"--name",
-			"cert-manager",
-			"--namespace",
-			"cert-manager",
-			"--version",
-			"v0.8.1",
-			"jetstack/cert-manager",
-		),
 	)
+	executeP("helm", "repo", "update")
+	executeP(
+		"helm",
+		"install",
+		"--name",
+		"cert-manager",
+		"--namespace",
+		"cert-manager",
+		"--version",
+		"v0.8.1",
+		"jetstack/cert-manager",
+	)
+}
+
+func executeP(cmd string, args ...string) {
+	log.Println(execute(cmd, args...))
 }
 
 func execute(cmd string, args ...string) string {
@@ -171,6 +268,9 @@ func execute(cmd string, args ...string) string {
 }
 
 func executeWithStdin(input, cmd string, args ...string) string {
+	log.Println("Executing Command (stdin): ")
+	log.Println(cmd + " " + strings.Join(args, " "))
+	log.Println(input)
 	command := exec.Command(cmd, args...)
 	stdinPipe, e := command.StdinPipe()
 	dieOnError(e)
