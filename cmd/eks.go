@@ -24,56 +24,135 @@ var EKSCmd = &cobra.Command{
 	Use:   "eks",
 	Short: "Work with an EKS cluster",
 	Run: func(cmd *cobra.Command, args []string) {
-
-		version := "v0.8.1"
-
-		executeP(
-			"kubectl",
-			"apply",
-			"-f",
-			"https://github.com/bitnami-labs/sealed-secrets/releases/download/"+version+"/controller.yaml",
-			)
-		executeP(
-			"kubectl",
-			"apply",
-			"-f",
-			"https://github.com/bitnami-labs/sealed-secrets/releases/download/"+version+"/sealedsecret-crd.yaml",
-		)
-
-		sm := secretsmanager.New(sess)
-		//
-		// see if a RSA keypair for already exist on the AWS account
-		//
-		response, err := sm.GetSecretValue(&secretsmanager.GetSecretValueInput{
-			SecretId:     aws.String("sealed-secrets/master-key"),
-		})
-
-		if err != nil {
-			if aerr, ok := err.(awserr.Error); ok {
-				switch aerr.Code() {
-				case secretsmanager.ErrCodeResourceNotFoundException:
-
-				}
+		cmds := []string{"kubectl", "helm"}
+		for _, cmd := range cmds {
+			if !commandExists(cmd) {
+				panic(cmd + " does not exist")
 			}
 		}
-
-		//cmds := []string{"kubectl", "helm"}
-		//for _, cmd := range cmds {
-		//	if !commandExists(cmd) {
-		//		panic(cmd + " does not exist")
-		//	}
-		//}
-		//log.Println("Setting up cluster ...")
-		//installTiller()
-		//time.Sleep(1000 * time.Millisecond)
-		//installNginx()
-		//time.Sleep(1000 * time.Millisecond)
-		//installCertManager()
-		//time.Sleep(1000 * time.Millisecond)
-		//installLetsEncryptIssuer(email)
-		//time.Sleep(1000 * time.Millisecond)
-		//installFluxCD(gitRepo)
+		log.Println("Setting up cluster ...")
+		installTiller()
+		time.Sleep(1000 * time.Millisecond)
+		installNginx()
+		time.Sleep(1000 * time.Millisecond)
+		installCertManager()
+		time.Sleep(1000 * time.Millisecond)
+		installLetsEncryptIssuer(email)
+		time.Sleep(1000 * time.Millisecond)
+		installFluxCD(gitRepo)
+		time.Sleep(1000 * time.Millisecond)
+		installSealedSecrets()
 	},
+}
+
+func installSealedSecrets() {
+	version := "v0.8.1"
+	executeP(
+		"kubectl",
+		"apply",
+		"-f",
+		"https://github.com/bitnami-labs/sealed-secrets/releases/download/"+version+"/controller.yaml",
+	)
+	sm := secretsmanager.New(sess)
+	//
+	// see if a RSA keypair for already exist on the AWS account
+	//
+	publicKeyResponse, err := sm.GetSecretValue(&secretsmanager.GetSecretValueInput{
+		SecretId: aws.String("sealed-secrets/master-key/public"),
+	})
+	privateKeyResponse, err := sm.GetSecretValue(&secretsmanager.GetSecretValueInput{
+		SecretId: aws.String("sealed-secrets/master-key/private"),
+	})
+	if err != nil {
+		if awsError, ok := err.(awserr.Error); ok {
+			switch awsError.Code() {
+			case secretsmanager.ErrCodeResourceNotFoundException:
+				log.Println("master key for sealed-secrets does not exist, attempting to create a new one")
+				//
+				// extract the public & private key
+				//
+				publicKey := execute(
+					"kubectl",
+					"-n",
+					"kube-system",
+					"get",
+					"secret",
+					"-l",
+					"sealedsecrets.bitnami.com/sealed-secrets-key=active",
+					"-o",
+					"jsonpath='{.items[0].data.tls\\.crt}'",
+				)
+				privateKey := execute(
+					"kubectl",
+					"-n",
+					"kube-system",
+					"get",
+					"secret",
+					"-l",
+					"sealedsecrets.bitnami.com/sealed-secrets-key=active",
+					"-o",
+					"jsonpath='{.items[0].data.tls\\.key}'",
+				)
+				resp1, err := sm.CreateSecret(
+					&secretsmanager.CreateSecretInput{
+						Name:         aws.String("sealed-secrets/master-key/public"),
+						SecretString: aws.String(publicKey),
+					})
+				resp2, err := sm.CreateSecret(
+					&secretsmanager.CreateSecretInput{
+						Name:         aws.String("sealed-secrets/master-key/private"),
+						SecretString: aws.String(privateKey),
+					},
+				)
+				if err != nil {
+					panic(err)
+				}
+				log.Println("public key ARN: " + *resp1.ARN)
+				log.Println("private key ARN: " + *resp2.ARN)
+			default:
+				panic(awsError)
+			}
+		}
+	} else {
+		//
+		// kubectl apply the restored master keys into the cluster
+		//
+		log.Println("Restoring sealed-secrets master key from secrets manager")
+		doc := `
+		apiVersion: v1
+		data:
+		  tls.crt: ` + *publicKeyResponse.SecretString + `
+		  tls.key: ` + *privateKeyResponse.SecretString + `
+		kind: Secret
+		metadata:
+		  creationTimestamp: null
+		  namespace: kube-system
+		  name: sealed-secrets-key
+		  selfLink: /api/v1/namespaces/kube-system/secrets/sealed-secrets-key
+		type: kubernetes.io/tls
+		`
+		log.Println(
+			executeWithStdin(
+				doc,
+				"kubectl",
+				"apply",
+				"-f",
+				"-",
+			),
+		)
+		//
+		// delete the old controller so the newly launched controller pod can pick up the new secrets
+		//
+		executeP(
+			"kubectl",
+			"delete",
+			"-n",
+			"kube-system",
+			"pod",
+			"-l",
+			"name=sealed-secrets-controller",
+		)
+	}
 }
 
 func init() {
@@ -85,7 +164,8 @@ func init() {
 	EKSCmd.MarkFlagRequired("email")
 	EKSCmd.MarkFlagRequired("dns-name")
 	EKSCmd.MarkFlagRequired("hosted-zone")
-	sess = session.Must(session.NewSession())
+	// FIXME do not hard code region
+	sess = session.Must(session.NewSession(&aws.Config{Region: aws.String("us-east-1")}))
 }
 
 func installNginx() {
