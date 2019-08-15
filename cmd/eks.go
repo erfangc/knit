@@ -6,10 +6,9 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/erfangc/knit/common"
 	"github.com/spf13/cobra"
-	"io"
 	"log"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -24,9 +23,9 @@ var EKSCmd = &cobra.Command{
 	Use:   "eks",
 	Short: "Work with an EKS cluster",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmds := []string{"kubectl", "helm"}
+		cmds := []string{"kubectl", "helm", "fluxctl"}
 		for _, cmd := range cmds {
-			if !commandExists(cmd) {
+			if !common.CommandExists(cmd) {
 				panic(cmd + " does not exist")
 			}
 		}
@@ -47,7 +46,7 @@ var EKSCmd = &cobra.Command{
 
 func installSealedSecrets() {
 	version := "v0.8.1"
-	executeP(
+	common.ExecuteP(
 		"kubectl",
 		"apply",
 		"-f",
@@ -71,7 +70,7 @@ func installSealedSecrets() {
 				//
 				// extract the public & private key
 				//
-				publicKey := execute(
+				publicKey := common.Execute(
 					"kubectl",
 					"-n",
 					"kube-system",
@@ -82,7 +81,7 @@ func installSealedSecrets() {
 					"-o",
 					"jsonpath='{.items[0].data.tls\\.crt}'",
 				)
-				privateKey := execute(
+				privateKey := common.Execute(
 					"kubectl",
 					"-n",
 					"kube-system",
@@ -132,7 +131,7 @@ func installSealedSecrets() {
 		type: kubernetes.io/tls
 		`
 		log.Println(
-			executeWithStdin(
+			common.ExecuteWithStdin(
 				doc,
 				"kubectl",
 				"apply",
@@ -143,7 +142,7 @@ func installSealedSecrets() {
 		//
 		// delete the old controller so the newly launched controller pod can pick up the new secrets
 		//
-		executeP(
+		common.ExecuteP(
 			"kubectl",
 			"delete",
 			"-n",
@@ -169,8 +168,8 @@ func init() {
 }
 
 func installNginx() {
-	executeP("helm", "install", "stable/nginx-ingress", "--name", "default")
-	var externalHostName = execute(
+	common.ExecuteP("helm", "install", "stable/nginx-ingress", "--name", "default")
+	var externalHostName = common.Execute(
 		"kubectl",
 		"get",
 		"svc",
@@ -181,7 +180,7 @@ func installNginx() {
 	for externalHostName == "''" {
 		log.Println("No external host name found for nginx-ingress-controller, waiting ...")
 		time.Sleep(10 * time.Second)
-		externalHostName = execute(
+		externalHostName = common.Execute(
 			"kubectl",
 			"get",
 			"svc",
@@ -227,7 +226,7 @@ func installNginx() {
 //
 func installFluxCD(gitRepo string) {
 	version := "1.13.3"
-	log.Println(execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-account.yaml"))
+	log.Println(common.Execute("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-account.yaml"))
 	deployment := `
 ---
 apiVersion: apps/v1
@@ -280,12 +279,15 @@ spec:
         - --git-branch=master
         - --listen-metrics=:3031
 `
-	executeWithStdin(deployment, "kubectl", "apply", "-f", "-")
-	executeP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-secret.yaml")
-	executeP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-dep.yaml")
-	executeP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-svc.yaml")
+	common.ExecuteWithStdin(deployment, "kubectl", "apply", "-f", "-")
+	common.ExecuteP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/flux-secret.yaml")
+	common.ExecuteP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-dep.yaml")
+	common.ExecuteP("kubectl", "apply", "-f", "https://raw.githubusercontent.com/fluxcd/flux/"+version+"/deploy/memcache-svc.yaml")
 }
 
+/**
+Install tiller (helm) so we can helm install things into the repo
+ */
 func installTiller() {
 	sa := `
 ---
@@ -295,7 +297,7 @@ metadata:
   name: tiller
   namespace: kube-system
 `
-	executeWithStdin(sa, "kubectl", "apply", "-f", "-")
+	common.ExecuteWithStdin(sa, "kubectl", "apply", "-f", "-")
 
 	clusterRoleBinding := `
 apiVersion: rbac.authorization.k8s.io/v1beta1
@@ -313,17 +315,20 @@ subjects:
     name: tiller
     namespace: kube-system
 `
-	executeWithStdin(
+	common.ExecuteWithStdin(
 		clusterRoleBinding,
 		"kubectl",
 		"apply",
 		"-f",
 		"-",
 	)
-	executeP("helm", "init", "--service-account=tiller")
-	executeP("helm", "repo", "update")
+	common.ExecuteP("helm", "init", "--service-account=tiller")
+	common.ExecuteP("helm", "repo", "update")
 }
 
+/**
+Install the LetsEncrypt issuer so we can obtain certificates from it
+ */
 func installLetsEncryptIssuer(email string) {
 	issuer := `
 apiVersion: certmanager.k8s.io/v1alpha1
@@ -338,25 +343,29 @@ spec:
       name: letsencrypt-prod
     http01: {}
 `
-	executeWithStdin(issuer, "kubectl", "apply", "-f", "-")
+	common.ExecuteWithStdin(issuer, "kubectl", "apply", "-f", "-")
 }
 
+/**
+Install jetstack cert-manager to manage TLS certificates from LetsEncrypt
+these certificates are used to power ingress
+ */
 func installCertManager() {
-	executeP(
+	common.ExecuteP(
 		"kubectl",
 		"apply",
 		"-f",
 		"https://raw.githubusercontent.com/jetstack/cert-manager/release-0.8/deploy/manifests/00-crds.yaml",
 	)
-	executeP(
+	common.ExecuteP(
 		"helm",
 		"repo",
 		"add",
 		"jetstack",
 		"https://charts.jetstack.io",
 	)
-	executeP("helm", "repo", "update")
-	executeP(
+	common.ExecuteP("helm", "repo", "update")
+	common.ExecuteP(
 		"helm",
 		"install",
 		"--name",
@@ -367,46 +376,4 @@ func installCertManager() {
 		"v0.8.1",
 		"jetstack/cert-manager",
 	)
-}
-
-func executeP(cmd string, args ...string) {
-	log.Println(execute(cmd, args...))
-}
-
-func execute(cmd string, args ...string) string {
-	log.Println("Executing Command: " + cmd + " " + strings.Join(args, " "))
-	command := exec.Command(cmd, args...)
-	bytes, e := command.CombinedOutput()
-	if e != nil {
-		log.Fatal(string(bytes))
-	}
-	return string(bytes)
-}
-
-func executeWithStdin(input, cmd string, args ...string) string {
-	log.Println("Executing Command (stdin): ")
-	log.Println(cmd + " " + strings.Join(args, " "))
-	log.Println(input)
-	command := exec.Command(cmd, args...)
-	stdinPipe, e := command.StdinPipe()
-	dieOnError(e)
-	_, e = io.WriteString(stdinPipe, input)
-	stdinPipe.Close()
-	dieOnError(e)
-	bytes, e := command.CombinedOutput()
-	if e != nil {
-		log.Fatal(string(bytes))
-	}
-	return string(bytes)
-}
-
-func dieOnError(e error) {
-	if e != nil {
-		log.Fatal(e.Error())
-	}
-}
-
-func commandExists(cmd string) bool {
-	_, err := exec.LookPath(cmd)
-	return err == nil
 }
