@@ -42,7 +42,7 @@ func ExecuteWithStdin(input, cmd string, args ...string) string {
 }
 
 func ExecuteP(cmd string, args ...string) {
-	log.Println(execute(cmd, args...))
+	log.Println(Execute(cmd, args...))
 }
 
 func dieOnError(e error) {
